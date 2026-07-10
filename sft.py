@@ -1,4 +1,5 @@
 import os
+import os; os.environ["WANDB_MODE"] = "disabled"
 import sys
 from typing import List
 import numpy as np 

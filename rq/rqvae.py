@@ -7,7 +7,7 @@ import logging
 
 from torch.utils.data import DataLoader
 
-from datasets import EmbDataset
+from datasets import EmbDataset, EmbDatasetWithCollab
 from models.rqvae import RQVAE
 from trainer import  Trainer
 
@@ -24,7 +24,11 @@ def parse_args():
     parser.add_argument('--warmup_epochs', type=int, default=50, help='warmup epochs')
     parser.add_argument("--data_path", type=str,
                         default="../data/Games/Games.emb-llama-td.npy",
-                        help="Input data path.")
+                        help="Input data path (text embedding .npy file).")
+    parser.add_argument("--collab_emb_path", type=str, default=None,
+                        help="Path to collaborative embedding .pt file. "
+                             "If provided, text+colab embeddings are concatenated "
+                             "with a learnable gate.")
 
     parser.add_argument("--weight_decay", type=float, default=0.0, help='l2 regularization weight')
     parser.add_argument("--dropout_prob", type=float, default=0.0, help="dropout ratio")
@@ -45,6 +49,14 @@ def parse_args():
 
     parser.add_argument('--save_limit', type=int, default=5)
     parser.add_argument("--ckpt_dir", type=str, default="", help="output directory for model")
+
+    # EMA + Codebook Reset parameters
+    parser.add_argument('--ema_decay', type=float, default=0.99,
+                        help='EMA decay rate for codebook update (0.0 disables EMA)')
+    parser.add_argument('--dead_threshold', type=float, default=2.0,
+                        help='EMA cluster size below which a code is considered dead')
+    parser.add_argument('--ema_warmup_steps', type=int, default=100,
+                        help='Number of training steps before dead code reset activates')
 
     return parser.parse_args()
 
@@ -67,7 +79,15 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
 
     """build dataset"""
-    data = EmbDataset(args.data_path)
+    if args.collab_emb_path:
+        print(f"Loading text + collaborative embeddings...")
+        data = EmbDatasetWithCollab(args.data_path, args.collab_emb_path)
+        collab_dim = data.collab_dim
+    else:
+        print(f"Loading text-only embeddings...")
+        data = EmbDataset(args.data_path)
+        collab_dim = 0
+
     model = RQVAE(in_dim=data.dim,
                   num_emb_list=args.num_emb_list,
                   e_dim=args.e_dim,
@@ -81,6 +101,10 @@ if __name__ == '__main__':
                   kmeans_iters=args.kmeans_iters,
                   sk_epsilons=args.sk_epsilons,
                   sk_iters=args.sk_iters,
+                  ema_decay=args.ema_decay,
+                  dead_threshold=args.dead_threshold,
+                  ema_warmup_steps=args.ema_warmup_steps,
+                  collab_dim=collab_dim,
                   )
     print(model)
     data_loader = DataLoader(data,num_workers=args.num_workers,

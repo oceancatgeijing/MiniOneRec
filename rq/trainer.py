@@ -9,6 +9,7 @@ from transformers import get_linear_schedule_with_warmup, get_constant_schedule_
 
 from utils import ensure_dir,set_color,get_local_time,delete_file
 import os
+import json
 
 import heapq
 class Trainer(object):
@@ -42,9 +43,111 @@ class Trainer(object):
         self.best_collision_rate = np.inf
         self.best_loss_ckpt = "best_loss_model.pth"
         self.best_collision_ckpt = "best_collision_model.pth"
+
+        # 结构化 metrics 日志：每个 eval_step 记录一次，训练结束后保存为 JSON
+        self.metrics_log = []
+        self._metrics_json_path = os.path.join(self.ckpt_dir, "training_metrics.json")
+
         self.optimizer = self._build_optimizer()
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
+
+    def _collect_metrics(self, epoch_idx, train_loss, train_recon_loss, collision_rate):
+        """
+        收集当前 eval_step 的所有指标，追加到结构化日志中。
+
+        指标包括：
+          - epoch: 当前 epoch
+          - train_loss / train_recon_loss: 训练损失
+          - collision_rate: SID 碰撞率
+          - codebook_usage: 每层 codebook 的 perplexity、dead_code 等
+        """
+        record = {
+            'epoch': epoch_idx,
+            'train_loss': round(train_loss, 6),
+            'train_recon_loss': round(train_recon_loss, 6),
+            'collision_rate': round(collision_rate, 6),
+        }
+
+        # 收集 codebook usage（如果模型支持）
+        try:
+            usage = self.model.rq.get_codebook_usage()
+            summary = usage['summary']
+            record['codebook'] = {
+                'avg_perplexity': round(summary['perplexity_mean'], 2),
+                'total_dead_codes': summary['dead_count_total'],
+                'dead_code_ratio': round(summary['dead_ratio_mean'], 4),
+                'per_layer': {}
+            }
+            for i in range(len(usage) - 1):  # exclude 'summary' key
+                layer_key = f'layer_{i}'
+                if layer_key in usage:
+                    u = usage[layer_key]
+                    record['codebook']['per_layer'][layer_key] = {
+                        'perplexity': round(u['perplexity'], 2),
+                        'codebook_size': self.model.rq.n_e_list[i],
+                        'dead_count': u['dead_count'],
+                        'usage_min': round(u['usage_min'], 2),
+                        'usage_mean': round(u['usage_mean'], 2),
+                        'usage_max': round(u['usage_max'], 2),
+                    }
+        except Exception:
+            pass  # 模型不支持 codebook usage 时静默跳过
+
+        self.metrics_log.append(record)
+
+        # 实时写入 JSON（确保即使训练中断也有记录）
+        try:
+            with open(self._metrics_json_path, 'w') as f:
+                json.dump(self.metrics_log, f, indent=2)
+        except Exception:
+            pass
+
+    def _log_codebook_stats(self, epoch_idx):
+        """
+        Log per-layer codebook utilization and gate stats at the end of each epoch.
+
+        Prints:
+          - Per-layer: perplexity / codebook_size (utilization %), dead code count
+          - Collab gate stats (mean/max activation) if using fusion model
+        """
+        try:
+            usage = self.model.rq.get_codebook_usage()
+            summary = usage['summary']
+        except Exception:
+            return  # model doesn't support codebook usage
+
+        # Build per-layer utilization string
+        layer_parts = []
+        for i in range(len(usage) - 1):  # exclude 'summary' key
+            layer_key = f'layer_{i}'
+            if layer_key in usage:
+                u = usage[layer_key]
+                ppl = u['perplexity']
+                cb_size = u['codebook_size']
+                util_pct = ppl / cb_size * 100
+                dead = u['dead_count']
+                layer_parts.append(f"L{i}: {util_pct:.0f}% ({int(ppl)}/{cb_size}) dead={dead}")
+
+        layer_str = " | ".join(layer_parts)
+
+        # Gate stats (if using collab fusion)
+        gate_str = ""
+        try:
+            gate_stats = self.model.get_gate_stats()
+            if gate_stats is not None:
+                gate_str = (f" | Gate: mean={gate_stats['gate_mean']:.3f} "
+                            f"max={gate_stats['gate_max']:.3f}")
+        except Exception:
+            pass
+
+        self.logger.info(
+            set_color(f"Epoch {epoch_idx} codebook", "cyan") +
+            f": {layer_str}"
+            f" | avg_ppl={summary['perplexity_mean']:.1f}"
+            f" | total_dead={summary['dead_count_total']}"
+            f"{gate_str}"
+        )
 
     def _build_optimizer(self):
 
@@ -104,7 +207,7 @@ class Trainer(object):
         iter_data = tqdm(
                     train_data,
                     total=len(train_data),
-                    ncols=100,
+                    ncols=120,
                     desc=set_color(f"Train {epoch_idx}","pink"),
                     )
 
@@ -118,9 +221,17 @@ class Trainer(object):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.scheduler.step()
-            # print(self.scheduler.get_last_lr())
             total_loss += loss.item()
             total_recon_loss += loss_recon.item()
+
+            # Log codebook usage stats in tqdm postfix (first batch of each epoch)
+            if batch_idx == 0:
+                usage = self.model.rq.get_codebook_usage()
+                summary = usage['summary']
+                iter_data.set_postfix({
+                    'ppl': f"{summary['perplexity_mean']:.1f}",
+                    'dead': f"{summary['dead_count_total']}",
+                })
 
         return total_loss, total_recon_loss
 
@@ -148,6 +259,29 @@ class Trainer(object):
                 indices_set.add(code)
 
         collision_rate = (num_sample - len(list(indices_set)))/num_sample
+
+        # Log per-level codebook usage stats
+        try:
+            usage = self.model.rq.get_codebook_usage()
+            summary = usage['summary']
+            self.logger.info(
+                set_color("  Codebook Usage", "cyan") +
+                f": avg_ppl={summary['perplexity_mean']:.1f} | "
+                f"total_dead={summary['dead_count_total']} | "
+                f"dead_ratio={summary['dead_ratio_mean']:.3f}"
+            )
+            for i in range(len(usage) - 1):  # exclude 'summary' key
+                layer_key = f'layer_{i}'
+                if layer_key in usage:
+                    u = usage[layer_key]
+                    self.logger.info(
+                        set_color(f"    L{i}", "cyan") +
+                        f": ppl={u['perplexity']:.1f}/{self.model.rq.n_e_list[i]} | "
+                        f"dead={u['dead_count']}/{self.model.rq.n_e_list[i]} | "
+                        f"usage=[{u['usage_min']:.1f}, {u['usage_mean']:.1f}, {u['usage_max']:.1f}]"
+                    )
+        except Exception as e:
+            self.logger.debug(f"  Could not get codebook usage: {e}")
 
         return collision_rate
 
@@ -198,6 +332,8 @@ class Trainer(object):
             )
             self.logger.info(train_loss_output)
 
+            # ---- Per-epoch codebook stats (always logged, even without eval) ----
+            self._log_codebook_stats(epoch_idx)
 
             # eval
             if (epoch_idx + 1) % self.eval_step == 0:
@@ -215,6 +351,9 @@ class Trainer(object):
                                           ckpt_file=self.best_collision_ckpt)
                 else:
                     cur_eval_step += 1
+
+                # 收集结构化 metrics（包含 codebook usage）
+                self._collect_metrics(epoch_idx, train_loss, train_recon_loss, collision_rate)
 
 
                 valid_end_time = time()

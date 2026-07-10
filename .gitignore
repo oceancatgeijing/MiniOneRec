@@ -1,0 +1,20 @@
+# Large files
+output_dir/
+hf_assets/
+*.pt
+*.pth
+*.log
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+
+# Symlinks (only top-level)
+/Amazon
+/Industrial_ckpt
+/Office_ckpt
+
+# OS
+.DS_Store
