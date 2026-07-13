@@ -5,7 +5,7 @@ import torch
 import json
 import os
 from transformers import GenerationConfig,  AutoTokenizer, BitsAndBytesConfig, AutoModelForCausalLM, LogitsProcessorList, TemperatureLogitsWarper
-from data import  EvalD3Dataset, EvalSidDataset
+from data import ConfigurableHistoryEvalDataset
 from LogitProcessor import ConstrainedLogitsProcessor
 from accelerate import Accelerator
 import random
@@ -48,6 +48,8 @@ def main(
     length_penalty: float=0.0,
     max_new_tokens: int = 256,
     num_beams: int = 50,
+    history_mode: str = "sid",
+    recent_n: int = 3,
 ):
     random.seed(seed)
     set_seed(seed)
@@ -139,8 +141,16 @@ def main(
     tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"
     
-    # val_dataset = EvalD3Dataset(train_file=test_data_path, tokenizer=tokenizer, max_len=2560, category=category, test=True, K=K, seed=seed)
-    val_dataset = EvalSidDataset(train_file=test_data_path, tokenizer=tokenizer, max_len=2560, category=category, test=True, K=K, seed=seed)
+    val_dataset = ConfigurableHistoryEvalDataset(
+        train_file=test_data_path,
+        tokenizer=tokenizer,
+        history_mode=history_mode,
+        recent_n=recent_n,
+        max_len=2560,
+        category=category,
+        test=True,
+        seed=seed,
+    )
         
     encodings = [val_dataset[i] for i in range(len(val_dataset))]
     # encodings = [val_dataset[i] for i in indexes]
@@ -237,7 +247,6 @@ def main(
 
 if __name__ == '__main__':
     fire.Fire(main)
-
 
 
 

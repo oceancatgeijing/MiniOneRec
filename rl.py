@@ -3,9 +3,9 @@ from trl import GRPOConfig, GRPOTrainer
 import random
 import numpy as np
 import torch
-from data import D3Dataset, SidDataset, RLTitle2SidDataset, RLSeqTitle2SidDataset, RLSid2TitleDataset, RLSidhis2TitleDataset
+from data import ConfigurableHistoryRLDataset, RLTitle2SidDataset
 from torch.utils.data import ConcatDataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 import os
 from minionerec_trainer import ReReTrainer
 from sasrec import SASRec
@@ -14,6 +14,12 @@ import pickle
 import math
 import json
 from sklearn.metrics import ndcg_score
+from debiased_rewards import (
+    build_item_popularity,
+    build_sid_embeddings,
+    make_trl_reward,
+    reward_registry,
+)
 
 os.environ['WANDB_MODE'] = 'disabled'
 
@@ -50,6 +56,7 @@ def train(
     eval_step: float = 0.199,
     num_generations: int = 16,
     num_train_epochs: int = 1,
+    max_steps: int = -1,
     learning_rate: float = 1e-6,
     beta: float = 0.04,
     beam_search: bool = False,
@@ -59,6 +66,18 @@ def train(
     sync_ref_model: bool = False,
     test_beam: int = 20,
     reward_type: str = "rule",
+    popularity_alpha: float = 0.5,
+    max_debiased_reward: float = 5.0,
+    novelty_bonus: float = 0.1,
+    popularity_penalty_weight: float = 0.2,
+    history_mode: str = "sid",
+    recent_n: int = 3,
+    enable_alignment_tasks: bool = True,
+    save_strategy: str = "epoch",
+    save_steps: float = 1.0,
+    save_total_limit: int = 1,
+    eval_strategy: str = "epoch",
+    save_model: bool = True,
     sample_train: bool = False,
     ada_path: str = "",
     cf_path: str = "",
@@ -85,12 +104,14 @@ def train(
     train_datasets = []
     # train_data = D3Dataset(train_file, category=category_dict[category], sample=sample)
     # train_datasets.append(train_data)
-    train_data1 = SidDataset(train_file, category=category_dict[category], sample=sample)
+    train_data1 = ConfigurableHistoryRLDataset(
+        train_file, history_mode=history_mode, recent_n=recent_n,
+        category=category_dict[category], sample=sample,
+    )
     train_datasets.append(train_data1)
-    train_data2 = RLTitle2SidDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
-    train_datasets.append(train_data2)
-    train_data3 = RLSeqTitle2SidDataset(train_file, category=category_dict[category], sample=10000)
-    train_datasets.append(train_data3)
+    if enable_alignment_tasks:
+        train_data2 = RLTitle2SidDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
+        train_datasets.append(train_data2)
     # train_data4 = RLSid2TitleDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
     # train_datasets.append(train_data4)
     # train_data5 = RLSidhis2TitleDataset(train_file, item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
@@ -101,7 +122,10 @@ def train(
     # train_datasets.append(train_data7)
     train_data = ConcatDataset(train_datasets)
     # eval_data = D3Dataset(eval_file, category=category_dict[category], sample=sample)
-    eval_data = SidDataset(eval_file, category=category_dict[category], sample=sample)
+    eval_data = ConfigurableHistoryRLDataset(
+        eval_file, history_mode=history_mode, recent_n=recent_n,
+        category=category_dict[category], sample=sample,
+    )
 
     train_dataset = Dataset.from_dict({k : [elm[k] for elm in train_data] for k in train_data[0].keys()})
     train_dataset = train_dataset.shuffle(seed=seed) 
@@ -133,8 +157,8 @@ def train(
     print("train_dataset: ", train_dataset)
     print("eval_dataset: ", eval_dataset)
 
-    llm_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
-    device = llm_model.device
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     len_seq = 10
@@ -142,16 +166,20 @@ def train(
     print(f"item_num: {item_num}")
 
     if reward_type == "sasrec":
+        if not cf_path:
+            raise ValueError("reward_type='sasrec' requires --cf_path")
         model = SASRec(32, item_num, len_seq, 0.3, device)
         model.to(device)
         model.load_state_dict(torch.load(cf_path))
         model.eval()
     if reward_type == "semantic":
+        if not ada_path:
+            raise ValueError("reward_type='semantic' requires --ada_path")
         with open(ada_path, "rb") as f:
             item_ada_embd = pickle.load(f)
-        item_ada_embd = torch.tensor(item_ada_embd).to(llm_model.device)
+        item_ada_embd = torch.tensor(item_ada_embd).to(device)
 
-    print("Load item_ada_embd successfully.")
+        print("Loaded semantic reward embeddings.")
 
     ndcg_rewards = [-1.0/math.log2(i+2) for i in range(num_generations)]
     ndcg_rewards = [-elm/sum(ndcg_rewards) for elm in ndcg_rewards]
@@ -243,6 +271,16 @@ def train(
             predictions = model.forward_eval(seq, torch.tensor(np.array(len_lis)).to(device))
             scores = torch.gather(predictions, 1,  pred.view(-1, 1)).view(-1)
         return scores
+
+    def resolve_targets(prompts):
+        try:
+            histories = [prompt2history[prompt] for prompt in prompts]
+            return [history2target[history] for history in histories]
+        except KeyError as exc:
+            raise KeyError(
+                "A GRPO prompt was not found in prompt2history. Ensure all enabled "
+                "datasets register prompt/target mappings before training."
+            ) from exc
     
 
 
@@ -256,14 +294,44 @@ def train(
         reward_fun = semantic_reward
     elif reward_type == "sasrec":
         reward_fun = cf_reward
+    elif reward_type in {"debiased", "pop_penalty", "partial_match", "combined"}:
+        reward_kwargs = {}
+        if reward_type in {"debiased", "pop_penalty", "combined"}:
+            reward_kwargs["item2pop"] = build_item_popularity(train_file)
+            reward_kwargs["popularity_alpha"] = popularity_alpha
+            reward_kwargs["max_debiased_reward"] = max_debiased_reward
+            reward_kwargs["novelty_bonus"] = novelty_bonus
+            reward_kwargs["popularity_penalty_weight"] = popularity_penalty_weight
+        reward_fun = make_trl_reward(
+            reward_type,
+            target_resolver=resolve_targets,
+            num_generations=num_generations,
+            **reward_kwargs,
+        )
+    elif reward_type == "sid_semantic":
+        reward_fun = make_trl_reward(
+            "semantic",
+            target_resolver=resolve_targets,
+            sid_embeddings=build_sid_embeddings(sid_index_path),
+            num_generations=num_generations,
+        )
+    else:
+        available = sorted(
+            {"rule", "ranking", "ranking_only", "semantic", "sid_semantic", "sasrec"}
+            | set(reward_registry)
+        )
+        raise ValueError(
+            f"Unknown reward_type={reward_type!r}. Available: {', '.join(available)}"
+        )
     
     os.environ['WANDB_PROJECT'] = wandb_project
     os.environ["WANDB_MODE"] = "offline"
 
     training_args = GRPOConfig(output_dir=output_dir,
-                                save_steps=0.1,
-                                save_total_limit=20,
-                                eval_strategy="steps",
+                                save_steps=save_steps,
+                                save_total_limit=save_total_limit,
+                                save_strategy=save_strategy,
+                                eval_strategy=eval_strategy,
                                 max_completion_length=128,
                                 num_generations=num_generations,
                                 temperature=temperature,
@@ -278,10 +346,10 @@ def train(
                                 warmup_ratio=0.03,
                                 max_grad_norm= 0.3,
                                 num_train_epochs=num_train_epochs,
+                                max_steps=max_steps,
                                 bf16=True,
                                 optim="paged_adamw_32bit",
                                 lr_scheduler_type="cosine", 
-                                save_strategy="steps",
                                 report_to="wandb",
                                 run_name=wandb_run_name,
                             )
@@ -306,11 +374,12 @@ def train(
 
     trainer.train()
 
-    trainer.save_model(output_dir)
+    if save_model:
+        trainer.save_model(output_dir)
 
-    output_dir = os.path.join(output_dir, "final_checkpoint")
-    trainer.model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+        output_dir = os.path.join(output_dir, "final_checkpoint")
+        trainer.model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
     
 if __name__ == "__main__":
     Fire(train)

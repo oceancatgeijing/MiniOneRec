@@ -174,6 +174,8 @@ def parse_args():
     parser.add_argument("--max_iter", type=int, default=100, help="Maximum number of iterations")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--verbose", action="store_true", help="Print detailed information")
+    parser.add_argument("--metrics_path", type=str, default=None,
+                        help="Optional JSON path for codebook and reconstruction metrics")
     return parser.parse_args()
 
 
@@ -267,6 +269,29 @@ if __name__ == "__main__":
     print(f"- Number of levels: {args.l}")
     print(f"- K values per level: {K_values}")
     print(f"- Final reconstruction error (MSE): {np.mean((embeddings - recon) ** 2):.6f}")
+
+    metrics = {
+        "method": "constrained_kmeans",
+        "item_count": int(len(codes_all.T)),
+        "unique_paths": int(len(set(map(tuple, codes_all.T)))),
+        "collision_rate": float(1 - len(set(map(tuple, codes_all.T))) / len(codes_all.T)),
+        "reconstruction_mse": float(np.mean((embeddings - recon) ** 2)),
+        "levels": [],
+    }
+    for level in range(codes_all.T.shape[1]):
+        used = int(len(np.unique(codes_all.T[:, level])))
+        metrics["levels"].append({
+            "level": level,
+            "used_codes": used,
+            "codebook_size": int(args.k),
+            "utilization": used / args.k,
+        })
+    metrics_path = args.metrics_path or os.path.join(
+        output_dir, f"{args.dataset}.sid_metrics.json"
+    )
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"SID metrics saved to: {metrics_path}")
 
     # Deduplication statistics
     codes_str = codes_df.with_columns(

@@ -22,7 +22,7 @@ import json
 import torch.nn as nn
 import bitsandbytes as bnb
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from data import D3Dataset, SFTData, SidSFTDataset, SidItemFeatDataset, FusionSeqRecDataset, PreferenceSFTDataset, UserPreference2sidSFTDataset, TitleHistory2SidSFTDataset
+from data import ConfigurableHistorySFTDataset, SidItemFeatDataset, FusionSeqRecDataset
 import random
 from datasets import Dataset as HFDataset
 from torch.utils.data import ConcatDataset
@@ -114,6 +114,11 @@ def train(
     train_from_scratch: bool = False,
     sid_index_path: str = "",
     item_meta_path: str = "",
+    history_mode: str = "sid",
+    recent_n: int = 3,
+    enable_alignment_tasks: bool = True,
+    enable_feature_alignment: bool = True,
+    enable_history_fusion: bool = True,
 ):
     set_seed(seed)
     os.environ['WANDB_PROJECT'] = wandb_project
@@ -191,18 +196,28 @@ def train(
         
     train_datasets = []
     # train_data1 = SFTData(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
-    train_data1 = SidSFTDataset(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
+    train_data1 = ConfigurableHistorySFTDataset(
+        train_file=train_file, tokenizer=tokenizer, history_mode=history_mode,
+        recent_n=recent_n, max_len=cutoff_len, sample=sample, seed=seed,
+        category=category,
+    )
     train_datasets.append(train_data1)
-    train_data2 = SidItemFeatDataset(item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
-    train_datasets.append(train_data2)
-    train_data3 = FusionSeqRecDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
-    train_datasets.append(train_data3)
+    if enable_alignment_tasks and enable_feature_alignment:
+        train_data2 = SidItemFeatDataset(item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
+        train_datasets.append(train_data2)
+    if enable_alignment_tasks and enable_history_fusion:
+        train_data3 = FusionSeqRecDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
+        train_datasets.append(train_data3)
     # train_data4 = SFTData(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
     # train_datasets.append(train_data4)
     # train_data5 = TitleHistory2SidSFTDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
     # train_datasets.append(train_data5)
     train_data = ConcatDataset(train_datasets)
-    val_data = SidSFTDataset(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
+    val_data = ConfigurableHistorySFTDataset(
+        train_file=eval_file, tokenizer=tokenizer, history_mode=history_mode,
+        recent_n=recent_n, max_len=cutoff_len, sample=sample, seed=seed,
+        category=category,
+    )
     # val_data = SFTData(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=20000, seed=seed, category=category)
     print("LOAD DATA FINISHED")    
     

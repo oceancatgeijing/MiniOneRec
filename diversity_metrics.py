@@ -170,8 +170,10 @@ def compute_tail_coverage(
     """
     # Identify tail items
     pops = sorted(item2pop.values())
-    threshold_idx = int(len(pops) * (1 - tail_ratio))
-    threshold = pops[threshold_idx] if threshold_idx < len(pops) else pops[-1]
+    if not pops:
+        return {k: 0.0 for k in topk}
+    cutoff = max(1, min(len(pops), int(math.ceil(len(pops) * tail_ratio))))
+    threshold = pops[cutoff - 1]
     tail_sids = {sid for sid, pop in item2pop.items() if pop <= threshold}
     print(f"Tail items (pop <= {threshold}): {len(tail_sids)} / {len(item2pop)}")
 

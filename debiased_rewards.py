@@ -23,9 +23,9 @@ Reward Types:
 
 import json
 import math
-import random
+import re
 from collections import Counter
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 
@@ -50,6 +50,28 @@ Returns:
 """
 
 
+SID_PATTERN = re.compile(r"<a_\d+><b_\d+><c_\d+>")
+
+
+def normalize_sid(value: str) -> str:
+    """Extract and normalize a three-level SID from generated text."""
+    text = str(value).strip().strip('"').strip()
+    match = SID_PATTERN.search(text)
+    return match.group(0) if match else text
+
+
+def _align_targets(targets: List[str], size: int) -> List[str]:
+    """Expand per-prompt targets when callers pass one target per GRPO group."""
+    if len(targets) == size:
+        return targets
+    if not targets or size % len(targets) != 0:
+        raise ValueError(
+            f"Cannot align {len(targets)} targets with {size} completions"
+        )
+    repeat = size // len(targets)
+    return [target for target in targets for _ in range(repeat)]
+
+
 # ---------------------------------------------------------------------------
 # Reward Type 1: Rule (Exact Match)
 # ---------------------------------------------------------------------------
@@ -62,8 +84,9 @@ def rule_reward(
 ) -> List[float]:
     """Binary reward: 1.0 for exact SID match, 0.0 otherwise."""
     rewards = []
+    targets = _align_targets(targets, len(completions))
     for comp, tgt in zip(completions, targets):
-        if comp.strip() == tgt.strip():
+        if normalize_sid(comp) == normalize_sid(tgt):
             rewards.append(1.0)
         else:
             rewards.append(0.0)
@@ -90,14 +113,15 @@ def ranking_reward(
     item_num = kwargs.get("item_num", 1)
 
     rewards = []
+    targets = _align_targets(targets, len(completions))
     for comp, tgt in zip(completions, targets):
         base = 0.0
 
         # CF score from SASRec
         if sasrec_model is not None:
             try:
-                comp_id = item2id.get(comp.strip())
-                tgt_id = item2id.get(tgt.strip())
+                comp_id = item2id.get(normalize_sid(comp))
+                tgt_id = item2id.get(normalize_sid(tgt))
                 if comp_id is not None and tgt_id is not None:
                     # Simplified: count as positive if both are valid items
                     base = 0.5
@@ -105,7 +129,7 @@ def ranking_reward(
                 pass
 
         # Exact match bonus
-        if comp.strip() == tgt.strip():
+        if normalize_sid(comp) == normalize_sid(tgt):
             base = max(base, 1.0)
 
         rewards.append(base)
@@ -129,12 +153,13 @@ def ndcg_rule_reward(
     beam_size = kwargs.get("num_generations", 16)
     rewards = []
 
+    targets = _align_targets(targets, len(completions))
     for i in range(0, len(completions), beam_size):
         beam_comps = completions[i : i + beam_size]
-        target = targets[i // beam_size] if i // beam_size < len(targets) else ""
+        beam_targets = targets[i : i + beam_size]
 
-        for rank, comp in enumerate(beam_comps):
-            if comp.strip() == target.strip():
+        for rank, (comp, target) in enumerate(zip(beam_comps, beam_targets)):
+            if normalize_sid(comp) == normalize_sid(target):
                 # DCG discount: 1 / log2(rank + 2)
                 rewards.append(1.0 / math.log2(rank + 2))
             else:
@@ -161,26 +186,27 @@ def debiased_reward(
     Requires item2pop: Dict[str, int] mapping SID string to count.
     """
     item2pop = kwargs.get("item2pop", {})
-    total = sum(item2pop.values()) if item2pop else 1
-    max_pop = max(item2pop.values()) if item2pop else 100
+    max_pop = max(item2pop.values()) if item2pop else 1
+    alpha = float(kwargs.get("popularity_alpha", 0.5))
+    novelty_bonus = float(kwargs.get("novelty_bonus", 0.1))
 
     rewards = []
+    targets = _align_targets(targets, len(completions))
     for comp, tgt in zip(completions, targets):
-        comp_sid = comp.strip()
-        tgt_sid = tgt.strip()
+        comp_sid = normalize_sid(comp)
+        tgt_sid = normalize_sid(tgt)
 
+        comp_pop = item2pop.get(comp_sid, 0)
+        normalized_pop = math.log1p(comp_pop) / math.log1p(max_pop)
+        candidate_novelty = 1.0 - normalized_pop
+        exact_weight = 0.0
         if comp_sid == tgt_sid:
-            # Inverse popularity weight (range ~0.1 to 1.0)
-            pop = item2pop.get(tgt_sid, max_pop)
-            weight = 1.0 - (pop / total)  # lower weight for popular items
-            weight = max(0.1, weight)      # floor at 0.1
-            rewards.append(weight)
-        else:
-            # Partial credit for non-exact but valid SID generation
-            if comp_sid and comp_sid.startswith("<a_"):
-                rewards.append(0.01)
-            else:
-                rewards.append(0.0)
+            target_pop = item2pop.get(tgt_sid, 1)
+            exact_weight = (max_pop / max(target_pop, 1)) ** alpha
+            exact_weight = min(
+                exact_weight, float(kwargs.get("max_debiased_reward", 5.0))
+            )
+        rewards.append(exact_weight + novelty_bonus * candidate_novelty)
 
     return rewards
 
@@ -200,19 +226,19 @@ def pop_penalty_reward(
     Popular items get penalized even on correct predictions.
     """
     item2pop = kwargs.get("item2pop", {})
-    max_pop = max(item2pop.values()) if item2pop else 10
+    max_pop = max(item2pop.values()) if item2pop else 1
+    penalty_weight = float(kwargs.get("popularity_penalty_weight", 0.2))
 
     rewards = []
+    targets = _align_targets(targets, len(completions))
     for comp, tgt in zip(completions, targets):
-        comp_sid = comp.strip()
-        tgt_sid = tgt.strip()
+        comp_sid = normalize_sid(comp)
+        tgt_sid = normalize_sid(tgt)
 
-        if comp_sid == tgt_sid:
-            pop = item2pop.get(tgt_sid, 1)
-            penalty = pop / max_pop  # [0, 1], 1 for hottest item
-            rewards.append(1.0 - 0.5 * penalty)  # max penalty halves the reward
-        else:
-            rewards.append(0.0)
+        pop = item2pop.get(comp_sid, 0)
+        penalty = math.log1p(pop) / math.log1p(max_pop)
+        exact = 1.0 if comp_sid == tgt_sid else 0.0
+        rewards.append(exact - penalty_weight * penalty)
 
     return rewards
 
@@ -238,26 +264,21 @@ def partial_match_reward(
     This addresses reward sparsity by providing intermediate signals.
     """
     def extract_levels(sid: str) -> Tuple[str, str, str]:
-        """Extract three levels from SID string like '<a_147><b_42><c_231>'."""
-        try:
-            parts = sid.strip().replace("><", "> <").split()
-            l0 = parts[0] if len(parts) > 0 else ""
-            l1 = " ".join(parts[:2]) if len(parts) > 1 else ""
-            return l0, l1, sid.strip()
-        except Exception:
-            return "", "", sid.strip()
+        normalized = normalize_sid(sid)
+        parts = re.findall(r"<[abc]_\d+>", normalized)
+        return tuple((parts + ["", "", ""])[:3])
 
+    targets = _align_targets(targets, len(completions))
     rewards = []
     for comp, tgt in zip(completions, targets):
-        c0, c1, _ = extract_levels(comp)
-        t0, t1, _ = extract_levels(tgt)
+        c0, c1, c2 = extract_levels(comp)
+        t0, t1, t2 = extract_levels(tgt)
 
-        if c0 == t0 and c1 == t1:
-            # Full L0+L1 match (implies L2 also correct since 3 levels)
+        if c0 and (c0, c1, c2) == (t0, t1, t2):
             rewards.append(1.0)
-        elif c0 == t0 and c1 == t1:
+        elif c0 and c1 and (c0, c1) == (t0, t1):
             rewards.append(0.5)
-        elif c0 == t0:
+        elif c0 and c0 == t0:
             rewards.append(0.2)
         else:
             rewards.append(0.0)
@@ -282,9 +303,10 @@ def semantic_reward(
     sid_emb = kwargs.get("sid_embeddings", {})
 
     rewards = []
+    targets = _align_targets(targets, len(completions))
     for comp, tgt in zip(completions, targets):
-        comp_vec = sid_emb.get(comp.strip())
-        tgt_vec = sid_emb.get(tgt.strip())
+        comp_vec = sid_emb.get(normalize_sid(comp))
+        tgt_vec = sid_emb.get(normalize_sid(tgt))
 
         if comp_vec is not None and tgt_vec is not None:
             sim = np.dot(comp_vec, tgt_vec) / (
@@ -332,6 +354,27 @@ reward_registry: Dict[str, RewardFn] = {
 }
 
 
+def make_trl_reward(
+    reward_type: str,
+    target_resolver: Callable[[List[str]], List[str]],
+    **reward_kwargs,
+) -> Callable[[List[str], List[str]], List[float]]:
+    """Adapt a registered reward to TRL's prompts/completions callback API."""
+    if reward_type not in reward_registry:
+        available = ", ".join(sorted(reward_registry))
+        raise ValueError(f"Unknown reward_type={reward_type!r}. Available: {available}")
+
+    reward_fn = reward_registry[reward_type]
+
+    def trl_reward(prompts, completions, **kwargs):
+        targets = target_resolver(prompts)
+        merged_kwargs = {**reward_kwargs, **kwargs}
+        return reward_fn(prompts, completions, targets, **merged_kwargs)
+
+    trl_reward.__name__ = f"{reward_type}_reward"
+    return trl_reward
+
+
 # ---------------------------------------------------------------------------
 # Utility: Build item popularity dictionary from training data
 # ---------------------------------------------------------------------------
@@ -351,8 +394,12 @@ def build_item_popularity(train_csv: str) -> Dict[str, int]:
 
     df = pd.read_csv(train_csv)
     pop = Counter()
-    for sid in df["item_sid"]:
-        pop[sid.strip()] += 1
+    if "item_sid" not in df.columns:
+        raise ValueError(f"{train_csv} must contain an 'item_sid' column")
+    for sid in df["item_sid"].dropna():
+        pop[normalize_sid(sid)] += 1
+    if not pop:
+        raise ValueError(f"No item SIDs found in {train_csv}")
     print(f"Built popularity dict: {len(pop)} unique SIDs, "
           f"max count={max(pop.values())}, min={min(pop.values())}")
     return dict(pop)
@@ -380,7 +427,7 @@ def build_sid_embeddings(index_json: str) -> Dict[str, np.ndarray]:
         for i, tok in enumerate(tokens):
             code = int(tok.split("_")[1].rstrip(">"))
             vec[i * 256 + code] = 1.0
-        embeddings[sid_str] = vec / np.linalg.norm(vec)
+        embeddings[sid_str] = vec / (np.linalg.norm(vec) + 1e-8)
 
     print(f"Built SID embeddings: {len(embeddings)} vectors, dim={256*3}")
     return embeddings

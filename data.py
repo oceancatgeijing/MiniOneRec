@@ -8,6 +8,7 @@ import random
 from tqdm import tqdm
 import os
 import copy
+import ast
 import torch.nn.functional as F
 
 class Tokenizer:
@@ -103,6 +104,133 @@ class JSONBaseDataset(BaseDataset):
             self.item_feat = json.load(f)
         with open(index_file, 'r') as f:
             self.indices = json.load(f)
+
+
+HISTORY_MODES = {"sid", "title", "sid_title", "sid_title_recent"}
+
+
+def _parse_history(value):
+    if isinstance(value, list):
+        return value
+    if pd.isna(value):
+        return []
+    parsed = ast.literal_eval(str(value))
+    return parsed if isinstance(parsed, list) else [parsed]
+
+
+def build_recommendation_prompt(row, history_mode="sid", recent_n=3):
+    """Build consistent recommendation prompts for SFT, GRPO, and evaluation."""
+    if history_mode not in HISTORY_MODES:
+        raise ValueError(
+            f"Unknown history_mode={history_mode!r}; choose from {sorted(HISTORY_MODES)}"
+        )
+
+    sids = [str(value) for value in _parse_history(row["history_item_sid"])]
+    titles = [str(value) for value in _parse_history(row["history_item_title"])]
+
+    if history_mode == "sid":
+        history = ", ".join(sids)
+        context = f"semantic IDs: {history}"
+    elif history_mode == "title":
+        history = ", ".join(f'"{title}"' for title in titles)
+        context = f"item titles: {history}"
+    else:
+        pairs = []
+        for index in range(max(len(sids), len(titles))):
+            sid = sids[index] if index < len(sids) else "<missing_sid>"
+            title = titles[index] if index < len(titles) else "<missing_title>"
+            pairs.append(f'{sid} (title: "{title}")')
+        context = "semantic IDs paired with titles: " + ", ".join(pairs)
+        if history_mode == "sid_title_recent":
+            recent_titles = titles[-max(int(recent_n), 1):]
+            recent = ", ".join(f'"{title}"' for title in recent_titles)
+            context += f". The most recent preference signal is: {recent}"
+
+    return (
+        "Can you predict the next possible item the user may expect, given "
+        f"the following chronological interaction history represented as {context}?"
+    )
+
+
+class ConfigurableHistoryMixin:
+    def _configure_history(self, history_mode, recent_n):
+        if history_mode not in HISTORY_MODES:
+            raise ValueError(
+                f"Unknown history_mode={history_mode!r}; choose from {sorted(HISTORY_MODES)}"
+            )
+        self.history_mode = history_mode
+        self.recent_n = recent_n
+
+    def get_history(self, row):
+        history_sids = [str(value) for value in _parse_history(row["history_item_sid"])]
+        target_sid = str(row["item_sid"])
+        return {
+            "input": build_recommendation_prompt(
+                row, history_mode=self.history_mode, recent_n=self.recent_n
+            ),
+            "output": target_sid + "\n",
+            "history_str": "::".join(history_sids),
+            "history_length": len(history_sids),
+            "dedup": bool(history_sids and target_sid == history_sids[-1]),
+        }
+
+
+class ConfigurableHistoryRLDataset(ConfigurableHistoryMixin, CSVBaseDataset):
+    def __init__(self, train_file, history_mode="sid", recent_n=3, sample=-1,
+                 seed=0, category="", dedup=False):
+        super().__init__(train_file, sample, seed, 1024, category, dedup, None, False)
+        self._configure_history(history_mode, recent_n)
+        self.prompt2history = {}
+        self.history2target = {}
+        self.get_inputs()
+
+    def pre(self, idx):
+        history = self.get_history(self.data.iloc[idx])
+        prompt = self.generate_prompt({"input": history["input"], "output": ""})
+        target = history["output"]
+        self.prompt2history[prompt] = history["history_str"]
+        self.history2target[history["history_str"]] = target
+        return {"prompt": prompt, "completion": target}
+
+
+class ConfigurableHistorySFTDataset(ConfigurableHistoryMixin, CSVBaseDataset):
+    def __init__(self, train_file, tokenizer, history_mode="sid", recent_n=3,
+                 max_len=2048, sample=-1, test=False, seed=0, category="",
+                 dedup=False):
+        super().__init__(train_file, sample, seed, max_len, category, dedup,
+                         tokenizer, test)
+        self._configure_history(history_mode, recent_n)
+        self.get_inputs()
+
+    def pre(self, idx):
+        instruction = (
+            "Below is an instruction that describes a task, paired with an input "
+            "that provides further context. Write a response that appropriately "
+            "completes the request.\n\n### Instruction:\nPredict the semantic ID "
+            "of the next item the user may expect.\n\n"
+        )
+        history = self.get_history(self.data.iloc[idx])
+        target = history["output"]
+        prompt = self.generate_prompt({"input": history["input"], "output": ""})
+        tokens = self.tokenizer.encode(instruction, bos=True, eos=False)
+        tokens += self.tokenizer.encode(prompt, bos=False, eos=False)
+        attention_mask = [1] * len(tokens)
+        if self.test:
+            return {"input_ids": tokens, "attention_mask": attention_mask}
+        prompt_len = len(tokens)
+        tokens += self.tokenizer.encode(target, bos=False, eos=True)
+        attention_mask = [1] * len(tokens)
+        labels = [-100] * prompt_len + tokens[prompt_len:]
+        return {
+            "input_ids": tokens[-self.max_len:],
+            "attention_mask": attention_mask[-self.max_len:],
+            "labels": labels[-self.max_len:],
+        }
+
+
+class ConfigurableHistoryEvalDataset(ConfigurableHistorySFTDataset):
+    def get_all(self):
+        return [self.get_history(self.data.iloc[i]) for i in range(len(self.data))]
 
 
 class SFTData(CSVBaseDataset):
